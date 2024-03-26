@@ -5,13 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import numpy as np
-import torch
-from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from .modeling import Sam
-from .predictor import SamPredictor
+from .triton_predictor import TritonSamPredictor
 from .utils.amg import (
     MaskData,
     area_from_rle,
@@ -23,7 +20,7 @@ from .utils.amg import (
     coco_encode_rle,
     generate_crop_boxes,
     is_box_near_crop_edge,
-    mask_to_rle_pytorch,
+    mask_to_rle,
     remove_small_regions,
     rle_to_mask,
     uncrop_boxes_xyxy,
@@ -35,7 +32,7 @@ from .utils.amg import (
 class SamAutomaticMaskGenerator:
     def __init__(
         self,
-        predictor: SamPredictor,
+        predictor: TritonSamPredictor,
         points_per_side: Optional[int] = 32,
         points_per_batch: int = 64,
         pred_iou_thresh: float = 0.88,
@@ -57,7 +54,7 @@ class SamAutomaticMaskGenerator:
         for SAM with a ViT-H backbone.
 
         Arguments:
-          predictor (SamPredictor): The SAM predictor to use for mask prediction.
+          predictor (TritonSamPredictor): The SAM predictor to use for mask prediction.
           points_per_side (int or None): The number of points to be sampled
             along one side of the image. The total number of points is
             points_per_side**2. If None, 'point_grids' must provide explicit
@@ -133,7 +130,6 @@ class SamAutomaticMaskGenerator:
         self.min_mask_region_area = min_mask_region_area
         self.output_mode = output_mode
 
-    @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
@@ -194,6 +190,89 @@ class SamAutomaticMaskGenerator:
 
         return curr_anns
 
+    #NMS implementation in Python and Numpy
+    def _nms(self, bboxes, psocres, threshold):
+        '''
+        NMS: first sort the bboxes by scores , 
+            keep the bbox with highest score as reference,
+            iterate through all other bboxes, 
+            calculate Intersection Over Union (IOU) between reference bbox and other bbox
+            if iou is greater than threshold,then discard the bbox and continue.
+            
+        Input:
+            bboxes(numpy array of tuples) : Bounding Box Proposals in the format (x_min,y_min,x_max,y_max).
+            pscores(numpy array of floats) : confidance scores for each bbox in bboxes.
+            threshold(float): Overlapping threshold above which proposals will be discarded.
+            
+        Output:
+            filtered_bboxes(numpy array) :selected bboxes for which IOU is less than threshold. 
+        '''
+        #Unstacking Bounding Box Coordinates
+        bboxes = bboxes.astype('float')
+        x_min = bboxes[:,0]
+        y_min = bboxes[:,1]
+        x_max = bboxes[:,2]
+        y_max = bboxes[:,3]
+        
+        #Sorting the pscores in descending order and keeping respective indices.
+        sorted_idx = psocres.argsort()[::-1]
+        #Calculating areas of all bboxes.Adding 1 to the side values to avoid zero area bboxes.
+        bbox_areas = (x_max-x_min+1)*(y_max-y_min+1)
+        
+        #list to keep filtered bboxes.
+        filtered = []
+        while len(sorted_idx) > 0:
+            #Keeping highest pscore bbox as reference.
+            rbbox_i = sorted_idx[0]
+            #Appending the reference bbox index to filtered list.
+            filtered.append(rbbox_i)
+            
+            #Calculating (xmin,ymin,xmax,ymax) coordinates of all bboxes w.r.t to reference bbox
+            overlap_xmins = np.maximum(x_min[rbbox_i],x_min[sorted_idx[1:]])
+            overlap_ymins = np.maximum(y_min[rbbox_i],y_min[sorted_idx[1:]])
+            overlap_xmaxs = np.minimum(x_max[rbbox_i],x_max[sorted_idx[1:]])
+            overlap_ymaxs = np.minimum(y_max[rbbox_i],y_max[sorted_idx[1:]])
+            
+            #Calculating overlap bbox widths,heights and there by areas.
+            overlap_widths = np.maximum(0,(overlap_xmaxs-overlap_xmins+1))
+            overlap_heights = np.maximum(0,(overlap_ymaxs-overlap_ymins+1))
+            overlap_areas = overlap_widths*overlap_heights
+            
+            #Calculating IOUs for all bboxes except reference bbox
+            ious = overlap_areas/(bbox_areas[rbbox_i]+bbox_areas[sorted_idx[1:]]-overlap_areas)
+            
+            #select indices for which IOU is greather than threshold
+            delete_idx = np.where(ious > threshold)[0]+1
+            delete_idx = np.concatenate(([0],delete_idx))
+            
+            #delete the above indices
+            sorted_idx = np.delete(sorted_idx,delete_idx)
+            
+        #Return filtered bboxes
+        return np.asarray(filtered)
+
+    def _batched_nms(
+            self,
+            boxes,
+            scores,
+            idxs,
+            iou_threshold: float,
+        ):
+        # strategy: in order to perform NMS independently per class,
+        # we add an offset to all the boxes. The offset is dependent
+        # only on the class idx, and is large enough so that boxes
+        # from different classes do not overlap
+        if len(boxes) == 0:
+            return np.empty((0,), dtype=np.int64)
+        max_coordinate = boxes.max()
+        offsets = idxs * (max_coordinate + 1)
+        boxes_for_nms = boxes + offsets[:, None]
+        keep = self._nms(boxes_for_nms, scores, iou_threshold)
+        return keep
+
+    def _box_area(self, boxes):
+        return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
     def _generate_masks(self, image: np.ndarray) -> MaskData:
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
@@ -209,17 +288,15 @@ class SamAutomaticMaskGenerator:
         # Remove duplicate masks between crops
         if len(crop_boxes) > 1:
             # Prefer masks from smaller crops
-            scores = 1 / box_area(data["crop_boxes"])
-            scores = scores.to(data["boxes"].device)
-            keep_by_nms = batched_nms(
-                data["boxes"].float(),
+            scores = 1 / self._box_area(data["crop_boxes"])
+            keep_by_nms = self._batched_nms(
+                data["boxes"].astype(float),
                 scores,
-                torch.zeros_like(data["boxes"][:, 0]),  # categories
+                np.zeros_like(data["boxes"][:, 0]),  # categories
                 iou_threshold=self.crop_nms_thresh,
             )
             data.filter(keep_by_nms)
 
-        data.to_numpy()
         return data
 
     def _process_crop(
@@ -248,10 +325,10 @@ class SamAutomaticMaskGenerator:
         self.predictor.reset_image()
 
         # Remove duplicates within this crop.
-        keep_by_nms = batched_nms(
-            data["boxes"].float(),
+        keep_by_nms = self._batched_nms(
+            data["boxes"].astype(float),
             data["iou_preds"],
-            torch.zeros_like(data["boxes"][:, 0]),  # categories
+            np.zeros_like(data["boxes"][:, 0]),  # categories
             iou_threshold=self.box_nms_thresh,
         )
         data.filter(keep_by_nms)
@@ -259,7 +336,7 @@ class SamAutomaticMaskGenerator:
         # Return to the original image frame
         data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
         data["points"] = uncrop_points(data["points"], crop_box)
-        data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
+        data["crop_boxes"] = np.asarray([crop_box for _ in range(len(data["rles"]))])
 
         return data
 
@@ -274,9 +351,9 @@ class SamAutomaticMaskGenerator:
 
         # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
-        in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
-        in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
-        masks, iou_preds, _ = self.predictor.predict_torch(
+        in_points = np.asarray(transformed_points)
+        in_labels = np.ones(in_points.shape[0], dtype=int)
+        masks, iou_preds, _ = self.predictor.predict_np(
             in_points[:, None, :],
             in_labels[:, None],
             multimask_output=True,
@@ -285,9 +362,9 @@ class SamAutomaticMaskGenerator:
 
         # Serialize predictions and store in MaskData
         data = MaskData(
-            masks=masks.flatten(0, 1),
-            iou_preds=iou_preds.flatten(0, 1),
-            points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
+            masks=masks,
+            iou_preds=iou_preds.ravel(),
+            points=points.repeat(masks.shape[1], axis=0),
         )
         del masks
 
@@ -301,7 +378,7 @@ class SamAutomaticMaskGenerator:
             data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
         )
         if self.stability_score_thresh > 0.0:
-            keep_mask = data["stability_score"] >= self.stability_score_thresh
+            keep_mask = (data["stability_score"] >= self.stability_score_thresh).ravel()
             data.filter(keep_mask)
 
         # Threshold masks and calculate boxes
@@ -310,12 +387,13 @@ class SamAutomaticMaskGenerator:
 
         # Filter boxes that touch crop boundaries
         keep_mask = ~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])
-        if not torch.all(keep_mask):
+        if not np.all(keep_mask):
             data.filter(keep_mask)
 
         # Compress to RLE
         data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
-        data["rles"] = mask_to_rle_pytorch(data["masks"])
+        data["masks"] = data["masks"][:, 0]  # A test
+        data["rles"] = mask_to_rle(data["masks"])
         del data["masks"]
 
         return data
@@ -346,26 +424,26 @@ class SamAutomaticMaskGenerator:
             mask, changed = remove_small_regions(mask, min_area, mode="islands")
             unchanged = unchanged and not changed
 
-            new_masks.append(torch.as_tensor(mask).unsqueeze(0))
+            new_masks.append(np.asarray(mask)[None])
             # Give score=0 to changed masks and score=1 to unchanged masks
             # so NMS will prefer ones that didn't need postprocessing
             scores.append(float(unchanged))
 
         # Recalculate boxes and remove any new duplicates
-        masks = torch.cat(new_masks, dim=0)
+        masks = np.concatenate(new_masks, axis=0)
         boxes = batched_mask_to_box(masks)
-        keep_by_nms = batched_nms(
+        keep_by_nms = SamAutomaticMaskGenerator._batched_nms(
             boxes.float(),
-            torch.as_tensor(scores),
-            torch.zeros_like(boxes[:, 0]),  # categories
+            np.asarray(scores),
+            np.zeros_like(boxes[:, 0]),  # categories
             iou_threshold=nms_thresh,
         )
 
         # Only recalculate RLEs for masks that have changed
         for i_mask in keep_by_nms:
             if scores[i_mask] == 0.0:
-                mask_torch = masks[i_mask].unsqueeze(0)
-                mask_data["rles"][i_mask] = mask_to_rle_pytorch(mask_torch)[0]
+                mask_np = masks[i_mask].unsqueeze(0)
+                mask_data["rles"][i_mask] = mask_to_rle(mask_np)[0]
                 mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly
         mask_data.filter(keep_by_nms)
 

@@ -1,11 +1,9 @@
 import numpy as np
 import tritonclient.http as httpclient
-import torch
 from typing import Optional, Tuple
 from PIL import Image
 from copy import deepcopy
 
-from .predictor import SamPredictor
 from .utils.transforms import ResizeLongestSide
 
 class MockModel():
@@ -13,11 +11,10 @@ class MockModel():
     mask_threshold = 0
 
 
-class TritonSamPredictor(SamPredictor):
+class TritonSamPredictor():
 
     def __init__(
         self,
-        sam=None,
         host='localhost',
         encoder_model_name='sam_encoder',
         decoder_model_name='sam_decoder',
@@ -29,10 +26,32 @@ class TritonSamPredictor(SamPredictor):
         self._encoder_model_name = encoder_model_name
         self._decoder_model_name = decoder_model_name
         self._client = httpclient.InferenceServerClient(url=host, proxy_host=proxy_host, proxy_port=proxy_port)
-        self.is_image_set = False
         self.img_size = img_size
         self.transform = ResizeLongestSide(img_size)
         self.model = MockModel()
+        self.reset_image()
+
+    def get_image_embedding(self) -> np.ndarray:
+        """
+        Returns the image embeddings for the currently set image, with
+        shape 1xCxHxW, where C is the embedding dimension and (H,W) are
+        the embedding spatial dimension of SAM (typically C=256, H=W=64).
+        """
+        if not self.is_image_set:
+            raise RuntimeError(
+                "An image must be set with .set_image(...) to generate an embedding."
+            )
+        assert self.features is not None, "Features must exist if an image has been set."
+        return self.features
+
+    def reset_image(self) -> None:
+        """Resets the currently set image."""
+        self.is_image_set = False
+        self.features = None
+        self.orig_h = None
+        self.orig_w = None
+        self.input_h = None
+        self.input_w = None
 
     def set_image(
         self,
@@ -77,13 +96,6 @@ class TritonSamPredictor(SamPredictor):
         self.input_w, self.input_h = resized_width, resized_height
         self.input_tensor = input_tensor
 
-    def set_torch_image(
-        self,
-        transformed_image: torch.Tensor,
-        original_image_size: Tuple[int, ...],
-    ):
-        raise NotImplementedError('set_torch_image')
-
     def _run_encoder(self):
         # Set Inputs
         input_tensors = [
@@ -99,7 +111,8 @@ class TritonSamPredictor(SamPredictor):
         query_response = self._client.infer(model_name=self._encoder_model_name,
                                         inputs=input_tensors,
                                         outputs=outputs)
-        return query_response.as_numpy("embeddings")
+        self.features = query_response.as_numpy("embeddings")
+        return self.features
 
     def _run_decoder(self, params):
         input_tensors = []
@@ -158,24 +171,15 @@ class TritonSamPredictor(SamPredictor):
         retvals = self._run_decoder(decoder_inputs)
         return retvals['masks'], retvals["iou_predictions"], retvals['low_res_masks']
 
-    def predict_torch(
+    def predict_np(
         self,
-        point_coords: Optional[torch.Tensor],
-        point_labels: Optional[torch.Tensor],
-        boxes: Optional[torch.Tensor] = None,
-        mask_input: Optional[torch.Tensor] = None,
+        point_coords: Optional[np.ndarray],
+        point_labels: Optional[np.ndarray],
+        boxes: Optional[np.ndarray] = None,
+        mask_input: Optional[np.ndarray] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-        if point_coords is not None:
-            point_coords = point_coords.numpy()
-        if point_labels is not None:
-            point_labels = point_labels.numpy()
-        if boxes is not None:
-            boxes = boxes.numpy()
-        if mask_input is not None:
-            mask_input = mask_input.numpy()
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
         retvals = self.predict(
             point_coords=point_coords,
@@ -185,7 +189,7 @@ class TritonSamPredictor(SamPredictor):
             multimask_output=multimask_output,
             return_logits=return_logits
         )
-        return [torch.from_numpy(val) for val in retvals]
+        return retvals
 
     def get_image_embedding(self):
         pass
