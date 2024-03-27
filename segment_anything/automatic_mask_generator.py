@@ -29,6 +29,86 @@ from .utils.amg import (
 )
 
 
+#NMS implementation in Python and Numpy
+def nms(bboxes, psocres, threshold):
+    '''
+    NMS: first sort the bboxes by scores , 
+        keep the bbox with highest score as reference,
+        iterate through all other bboxes, 
+        calculate Intersection Over Union (IOU) between reference bbox and other bbox
+        if iou is greater than threshold,then discard the bbox and continue.
+
+    Input:
+        bboxes(numpy array of tuples) : Bounding Box Proposals in the format (x_min,y_min,x_max,y_max).
+        pscores(numpy array of floats) : confidance scores for each bbox in bboxes.
+        threshold(float): Overlapping threshold above which proposals will be discarded.
+
+    Output:
+        filtered_bboxes(numpy array) :selected bboxes for which IOU is less than threshold. 
+    '''
+    #Unstacking Bounding Box Coordinates
+    bboxes = bboxes.astype('float')
+    x_min = bboxes[:,0]
+    y_min = bboxes[:,1]
+    x_max = bboxes[:,2]
+    y_max = bboxes[:,3]
+
+    #Sorting the pscores in descending order and keeping respective indices.
+    sorted_idx = psocres.argsort()[::-1]
+    #Calculating areas of all bboxes.Adding 1 to the side values to avoid zero area bboxes.
+    bbox_areas = (x_max-x_min+1)*(y_max-y_min+1)
+
+    #list to keep filtered bboxes.
+    filtered = []
+    while len(sorted_idx) > 0:
+        #Keeping highest pscore bbox as reference.
+        rbbox_i = sorted_idx[0]
+        #Appending the reference bbox index to filtered list.
+        filtered.append(rbbox_i)
+
+        #Calculating (xmin,ymin,xmax,ymax) coordinates of all bboxes w.r.t to reference bbox
+        overlap_xmins = np.maximum(x_min[rbbox_i],x_min[sorted_idx[1:]])
+        overlap_ymins = np.maximum(y_min[rbbox_i],y_min[sorted_idx[1:]])
+        overlap_xmaxs = np.minimum(x_max[rbbox_i],x_max[sorted_idx[1:]])
+        overlap_ymaxs = np.minimum(y_max[rbbox_i],y_max[sorted_idx[1:]])
+
+        #Calculating overlap bbox widths,heights and there by areas.
+        overlap_widths = np.maximum(0,(overlap_xmaxs-overlap_xmins+1))
+        overlap_heights = np.maximum(0,(overlap_ymaxs-overlap_ymins+1))
+        overlap_areas = overlap_widths*overlap_heights
+
+        #Calculating IOUs for all bboxes except reference bbox
+        ious = overlap_areas/(bbox_areas[rbbox_i]+bbox_areas[sorted_idx[1:]]-overlap_areas)
+
+        #select indices for which IOU is greather than threshold
+        delete_idx = np.where(ious > threshold)[0]+1
+        delete_idx = np.concatenate(([0],delete_idx))
+
+        #delete the above indices
+        sorted_idx = np.delete(sorted_idx,delete_idx)
+
+    #Return filtered bboxes
+    return np.asarray(filtered)
+
+def batched_nms(
+        boxes,
+        scores,
+        idxs,
+        iou_threshold: float,
+    ):
+    # strategy: in order to perform NMS independently per class,
+    # we add an offset to all the boxes. The offset is dependent
+    # only on the class idx, and is large enough so that boxes
+    # from different classes do not overlap
+    if len(boxes) == 0:
+        return np.empty((0,), dtype=np.int64)
+    max_coordinate = boxes.max()
+    offsets = idxs * (max_coordinate + 1)
+    boxes_for_nms = boxes + offsets[:, None]
+    keep = nms(boxes_for_nms, scores, iou_threshold)
+    return keep
+
+
 class SamAutomaticMaskGenerator:
     def __init__(
         self,
@@ -190,86 +270,6 @@ class SamAutomaticMaskGenerator:
 
         return curr_anns
 
-    #NMS implementation in Python and Numpy
-    def _nms(self, bboxes, psocres, threshold):
-        '''
-        NMS: first sort the bboxes by scores , 
-            keep the bbox with highest score as reference,
-            iterate through all other bboxes, 
-            calculate Intersection Over Union (IOU) between reference bbox and other bbox
-            if iou is greater than threshold,then discard the bbox and continue.
-            
-        Input:
-            bboxes(numpy array of tuples) : Bounding Box Proposals in the format (x_min,y_min,x_max,y_max).
-            pscores(numpy array of floats) : confidance scores for each bbox in bboxes.
-            threshold(float): Overlapping threshold above which proposals will be discarded.
-            
-        Output:
-            filtered_bboxes(numpy array) :selected bboxes for which IOU is less than threshold. 
-        '''
-        #Unstacking Bounding Box Coordinates
-        bboxes = bboxes.astype('float')
-        x_min = bboxes[:,0]
-        y_min = bboxes[:,1]
-        x_max = bboxes[:,2]
-        y_max = bboxes[:,3]
-        
-        #Sorting the pscores in descending order and keeping respective indices.
-        sorted_idx = psocres.argsort()[::-1]
-        #Calculating areas of all bboxes.Adding 1 to the side values to avoid zero area bboxes.
-        bbox_areas = (x_max-x_min+1)*(y_max-y_min+1)
-        
-        #list to keep filtered bboxes.
-        filtered = []
-        while len(sorted_idx) > 0:
-            #Keeping highest pscore bbox as reference.
-            rbbox_i = sorted_idx[0]
-            #Appending the reference bbox index to filtered list.
-            filtered.append(rbbox_i)
-            
-            #Calculating (xmin,ymin,xmax,ymax) coordinates of all bboxes w.r.t to reference bbox
-            overlap_xmins = np.maximum(x_min[rbbox_i],x_min[sorted_idx[1:]])
-            overlap_ymins = np.maximum(y_min[rbbox_i],y_min[sorted_idx[1:]])
-            overlap_xmaxs = np.minimum(x_max[rbbox_i],x_max[sorted_idx[1:]])
-            overlap_ymaxs = np.minimum(y_max[rbbox_i],y_max[sorted_idx[1:]])
-            
-            #Calculating overlap bbox widths,heights and there by areas.
-            overlap_widths = np.maximum(0,(overlap_xmaxs-overlap_xmins+1))
-            overlap_heights = np.maximum(0,(overlap_ymaxs-overlap_ymins+1))
-            overlap_areas = overlap_widths*overlap_heights
-            
-            #Calculating IOUs for all bboxes except reference bbox
-            ious = overlap_areas/(bbox_areas[rbbox_i]+bbox_areas[sorted_idx[1:]]-overlap_areas)
-            
-            #select indices for which IOU is greather than threshold
-            delete_idx = np.where(ious > threshold)[0]+1
-            delete_idx = np.concatenate(([0],delete_idx))
-            
-            #delete the above indices
-            sorted_idx = np.delete(sorted_idx,delete_idx)
-            
-        #Return filtered bboxes
-        return np.asarray(filtered)
-
-    def _batched_nms(
-            self,
-            boxes,
-            scores,
-            idxs,
-            iou_threshold: float,
-        ):
-        # strategy: in order to perform NMS independently per class,
-        # we add an offset to all the boxes. The offset is dependent
-        # only on the class idx, and is large enough so that boxes
-        # from different classes do not overlap
-        if len(boxes) == 0:
-            return np.empty((0,), dtype=np.int64)
-        max_coordinate = boxes.max()
-        offsets = idxs * (max_coordinate + 1)
-        boxes_for_nms = boxes + offsets[:, None]
-        keep = self._nms(boxes_for_nms, scores, iou_threshold)
-        return keep
-
     def _box_area(self, boxes):
         return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
@@ -289,7 +289,7 @@ class SamAutomaticMaskGenerator:
         if len(crop_boxes) > 1:
             # Prefer masks from smaller crops
             scores = 1 / self._box_area(data["crop_boxes"])
-            keep_by_nms = self._batched_nms(
+            keep_by_nms = batched_nms(
                 data["boxes"].astype(float),
                 scores,
                 np.zeros_like(data["boxes"][:, 0]),  # categories
@@ -325,7 +325,7 @@ class SamAutomaticMaskGenerator:
         self.predictor.reset_image()
 
         # Remove duplicates within this crop.
-        keep_by_nms = self._batched_nms(
+        keep_by_nms = batched_nms(
             data["boxes"].astype(float),
             data["iou_preds"],
             np.zeros_like(data["boxes"][:, 0]),  # categories
@@ -431,8 +431,8 @@ class SamAutomaticMaskGenerator:
         # Recalculate boxes and remove any new duplicates
         masks = np.concatenate(new_masks, axis=0)
         boxes = batched_mask_to_box(masks)
-        keep_by_nms = SamAutomaticMaskGenerator._batched_nms(
-            boxes.float(),
+        keep_by_nms = batched_nms(
+            boxes.astype(float),
             np.asarray(scores),
             np.zeros_like(boxes[:, 0]),  # categories
             iou_threshold=nms_thresh,

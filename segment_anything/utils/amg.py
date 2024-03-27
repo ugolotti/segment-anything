@@ -55,14 +55,14 @@ class MaskData:
 
     def cat(self, new_stats: "MaskData") -> None:
         for k, v in new_stats.items():
-            if not len(v):
-                continue
             if k not in self._stats or self._stats[k] is None:
                 self._stats[k] = deepcopy(v)
             elif isinstance(v, np.ndarray):
-                self._stats[k] = np.concatenate([self._stats[k], v], axis=0)
+                if len(v):
+                    self._stats[k] = np.concatenate([self._stats[k], v], axis=0)
             elif isinstance(v, list):
-                self._stats[k] = self._stats[k] + deepcopy(v)
+                if len(v):
+                    self._stats[k] = self._stats[k] + deepcopy(v)
             else:
                 raise TypeError(f"MaskData key {k} has an unsupported type {type(v)}.")
 
@@ -254,8 +254,8 @@ def uncrop_masks(
         return masks
     # Coordinate transform masks
     pad_x, pad_y = orig_w - (x1 - x0), orig_h - (y1 - y0)
-    pad = (x0, pad_x - x0, y0, pad_y - y0)
-    return np.pad(masks, pad, constant_values=0)
+    pad = ((y0, pad_y - y0), (x0, pad_x - x0))
+    return np.asarray([np.pad(np.squeeze(m), pad, constant_values=0)[None] for m in masks])
 
 
 def remove_small_regions(
@@ -307,7 +307,7 @@ def batched_mask_to_box(masks: np.ndarray) -> np.ndarray:
     shape = masks.shape
     h, w = shape[-2:]
     if len(shape) > 2:
-        masks = masks.reshape((np.prod(shape[:-3]), ) + shape[-3:])
+        masks = masks.reshape((np.prod(shape[:-3], dtype=int), ) + shape[-3:])
     else:
         masks = masks
 
