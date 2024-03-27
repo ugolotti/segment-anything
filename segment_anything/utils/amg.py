@@ -97,6 +97,8 @@ def mask_to_rle(tensor: np.ndarray) -> List[Dict[str, Any]]:
     Encodes masks to an uncompressed RLE, in the format expected by
     pycoco tools.
     """
+    if len(tensor) == 0:
+        return []
     # Put in fortran order and flatten h,w
     b, h, w = tensor.shape
     # tensor = tensor.permute(0, 2, 1).flatten(1)
@@ -296,7 +298,7 @@ def batched_mask_to_box(masks: np.ndarray) -> np.ndarray:
     """
     # max below raises an error on empty inputs, just skip in this case
     if len(masks) == 0:
-        return np.zeros(*masks.shape[:-2], 4)
+        return np.zeros((*masks.shape[:-2], 4))
 
     # Normalize shape to CxHxW
     shape = masks.shape

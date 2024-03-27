@@ -392,8 +392,7 @@ class SamAutomaticMaskGenerator:
 
         # Compress to RLE
         data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
-        data["masks"] = data["masks"][:, 0]  # A test
-        data["rles"] = mask_to_rle(data["masks"])
+        data["rles"] = mask_to_rle(np.squeeze(data["masks"]))
         del data["masks"]
 
         return data
@@ -442,7 +441,7 @@ class SamAutomaticMaskGenerator:
         # Only recalculate RLEs for masks that have changed
         for i_mask in keep_by_nms:
             if scores[i_mask] == 0.0:
-                mask_np = masks[i_mask].unsqueeze(0)
+                mask_np = masks[i_mask][None, :]
                 mask_data["rles"][i_mask] = mask_to_rle(mask_np)[0]
                 mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly
         mask_data.filter(keep_by_nms)
