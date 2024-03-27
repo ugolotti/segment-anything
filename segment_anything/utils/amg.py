@@ -55,6 +55,8 @@ class MaskData:
 
     def cat(self, new_stats: "MaskData") -> None:
         for k, v in new_stats.items():
+            if not len(v):
+                continue
             if k not in self._stats or self._stats[k] is None:
                 self._stats[k] = deepcopy(v)
             elif isinstance(v, np.ndarray):
@@ -99,9 +101,10 @@ def mask_to_rle(tensor: np.ndarray) -> List[Dict[str, Any]]:
     """
     if len(tensor) == 0:
         return []
+    if len(tensor.shape) == 2:
+        tensor = tensor[None, :]
     # Put in fortran order and flatten h,w
     b, h, w = tensor.shape
-    # tensor = tensor.permute(0, 2, 1).flatten(1)
     tensor = np.transpose(tensor, (0, 2, 1)).reshape(tensor.shape[0], -1)
 
     # Compute change indices
