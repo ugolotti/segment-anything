@@ -131,7 +131,7 @@ class TritonSamPredictor():
         self,
         point_coords: Optional[np.ndarray] = None,
         point_labels: Optional[np.ndarray] = None,
-        box: Optional[np.ndarray] = None,
+        boxes: Optional[np.ndarray] = None,
         mask_input: Optional[np.ndarray] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
@@ -141,12 +141,12 @@ class TritonSamPredictor():
 
         embeddings = self._run_encoder()
 
-        # onnx_coord = np.concatenate([point_coords, np.array([[0.0, 0.0]])], axis=0)[None, :, :]
-        # onnx_label = np.concatenate([point_labels, np.array([-1])])[None, :].astype(np.float32)
-
         batch_size = 1  # len(point_coords)
 
-        onnx_coord = point_coords
+        if point_coords is not None:
+            onnx_coord = point_coords
+        elif boxes is not None:
+            onnx_coord = boxes.reshape(-1, 2)[None, :, :]
         onnx_label = point_labels.astype(np.float32)
 
         coords = deepcopy(onnx_coord).astype(float)
