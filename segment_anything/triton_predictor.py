@@ -147,6 +147,8 @@ class TritonSamPredictor():
             onnx_coord = point_coords
         elif boxes is not None:
             onnx_coord = boxes.reshape(-1, 2)[None, :, :]
+        if point_labels is None:
+            point_labels = np.ones((1, 1))
         onnx_label = point_labels.astype(np.float32)
 
         coords = deepcopy(onnx_coord).astype(float)
@@ -184,7 +186,7 @@ class TritonSamPredictor():
         retvals = self.predict(
             point_coords=point_coords,
             point_labels=point_labels,
-            box=boxes,
+            boxes=boxes,
             mask_input=mask_input,
             multimask_output=multimask_output,
             return_logits=return_logits
